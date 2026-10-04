@@ -5,6 +5,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from tools import ALL_TOOLS
 from middleware import MIDDLEWARE
 
+from tools import init_rag
+
+print(f"rag index ready: {init_rag()} docs")
+
 agent = create_agent(
     model="google_genai:gemini-2.5-flash",
     tools=ALL_TOOLS,

@@ -9,4 +9,5 @@ traces/
 *.db
 *.sqlite3
 .vscode/
+docs.txt
 "@ | Out-File -Encoding utf8 .gitignore

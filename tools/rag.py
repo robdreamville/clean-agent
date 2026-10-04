@@ -28,10 +28,10 @@ from google import genai
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-EMBED_MODEL = "text-embedding-004"
+EMBED_MODEL = "gemini-embedding-001" 
 GEN_MODEL = "gemini-2.5-flash"          # used only for count_tokens
 PHOENIX_ENDPOINT = "http://localhost:6006/v1/traces"
-CAPTURE_CONTENT = False               # True = also store chunk text on spans (dev only)
+CAPTURE_CONTENT = True               # True = also store chunk text on spans (dev only)
 
 TOP_K_SEARCH = 5
 TOP_K_RERANK = 3
@@ -172,6 +172,13 @@ def _count_tokens(text: str) -> int:
     return _genai().models.count_tokens(model=GEN_MODEL, contents=text).total_tokens
 
 
+def init_rag() -> int:
+    """Load docs, embed once, build the in-memory index. Call once at startup."""
+    init_tracing()
+    docs = load_documents()
+    _DOCS_BY_ID.update({d.id: d for d in docs})
+    _INDEX.update(build_index(docs))
+    return len(docs)
 # ---------------------------------------------------------------------------
 # Pipeline stages — each opens its own span (the image's CAPTURE boxes)
 # ---------------------------------------------------------------------------
@@ -304,9 +311,9 @@ try:
     rag_search = _lc_tool(
         "rag_search",
         description=(
-            "Search the local knowledge base for relevant context. "
-            "Use when the user asks about Roberto's background, projects, "
-            "or anything that might be in the indexed documents."
+            "Search Roberto's personal documents and notes by semantic similarity. "
+            "Always pass the user's FULL question as the query text, not keywords or names. "
+            "Returns the top matching documents with IDs, categories, and similarity scores."
         ),
     )(_rag_tool_fn)
 except ImportError:  # langchain not installed (standalone testing)
@@ -325,8 +332,9 @@ if __name__ == "__main__":
 
     test_queries = [
         "Where does Roberto currently work?",
-        "Which projects use vector databases?",
-        "What was done about the water heater?",
+        #"Which projects use vector databases?",
+        #"What was done about the water heater?",
+        #"What is Roberto's favorite food?",
     ]
     for q in test_queries:
         print(f"\n=== QUERY: {q}")
