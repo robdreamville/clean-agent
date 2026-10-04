@@ -1,0 +1,27 @@
+# docs.example.txt — SAMPLE corpus format for the clean-agent RAG pipeline.
+#
+# This file is FICTIONAL test data so the repo is runnable without real documents.
+# To use it: copy this file to tools/docs.txt (which is gitignored and never committed).
+#   cp tools/docs.example.txt tools/docs.txt
+# Or point the loader at any corpus with:  $env:RAG_DOCS_PATH = "path\to\your\docs.txt"
+#
+# Format: entries are split on "Expanded Document N:" headers. Each entry needs a
+# "Metadata:" line with doc_id and category, then the body text after it.
+
+Expanded Document 1:
+Metadata: doc_id: ex-001 | category: bio
+
+Content:
+SAMPLE RECORD (fictional): Jordan Ellis is a supply-chain coordinator based in Columbus, Ohio. B.A. in Logistics from Ohio State University (2020). Currently employed at Meridian Freight (2021 to present); previously a warehouse associate at Buckeye Storage (2020 to 2021). Outside work, Jordan runs marathons and volunteers at a local food bank.
+
+Expanded Document 2:
+Metadata: doc_id: ex-002 | category: software_ai
+
+Content:
+SAMPLE RECORD (fictional): Project "Harborlight" is a prototype book-recommendation engine written in Python. It embeds anonymized reading histories, clusters them with KMeans, and serves suggestions through a small Flask API backed by an in-memory vector index. Evaluation ran against a held-out set of synthetic user profiles; the prototype was never deployed to production.
+
+Expanded Document 3:
+Metadata: doc_id: ex-003 | category: home_auto
+
+Content:
+SAMPLE RECORD (fictional): Replaced the cabin air filter and wiper blades on a 2018 hatchback. Removed the glove-box assembly to access the filter housing, torqued the housing screws to spec, cleared leaves from the cowl drain, refilled washer fluid, and verified the spray pattern on both nozzles.
