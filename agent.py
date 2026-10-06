@@ -31,7 +31,13 @@ if USE == "ollama":
         num_predict=1024,   # cap output length: faster, less rambling
     )
 else:
-    MODEL = "google_genai:gemini-2.5-flash"
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    MODEL = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0,           # deterministic: cleaner tool calls
+        max_output_tokens=1024,  # cap output length: less rambling, cheaper
+        # no keep_alive needed (API side), no num_ctx needed (1M context)
+    )
 print(f"using model: {MODEL}")
 
 from tools import ALL_TOOLS
