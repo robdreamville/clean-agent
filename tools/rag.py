@@ -146,6 +146,10 @@ _embedding_cache: dict[str, list[float]] = {}
 
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
+    if os.getenv("MODEL", "gemini") == "ollama":
+        # offline: local embeddings (needs `ollama pull nomic-embed-text` once)
+        from langchain_ollama import OllamaEmbeddings
+        return OllamaEmbeddings(model="nomic-embed-text").embed_documents(texts)
     resp = _genai().models.embed_content(model=EMBED_MODEL, contents=texts)
     return [list(e.values) for e in resp.embeddings]
 
@@ -169,6 +173,8 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 def _count_tokens(text: str) -> int:
     """Real token count via Gemini (free call, no quota impact)."""
+    if os.getenv("MODEL", "gemini") == "ollama":
+        return len(text) // 4  # rough offline estimate (~4 chars/token)
     return _genai().models.count_tokens(model=GEN_MODEL, contents=text).total_tokens
 
 
