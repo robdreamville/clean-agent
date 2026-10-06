@@ -25,7 +25,6 @@ if USE == "ollama":
     from langchain_ollama import ChatOllama
     MODEL = ChatOllama(
         model="gemma4:e2b",
-        temperature=0,      # deterministic: cleaner tool calls
         keep_alive="30m",   # keep loaded between runs, skip the reload wait
         num_ctx=8192,       # room for long tool histories (default 2048 chops them)
         num_predict=1024,   # cap output length: faster, less rambling
@@ -34,7 +33,6 @@ else:
     from langchain_google_genai import ChatGoogleGenerativeAI
     MODEL = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash",
-        temperature=0,           # deterministic: cleaner tool calls
         max_output_tokens=1024,  # cap output length: less rambling, cheaper
         # no keep_alive needed (API side), no num_ctx needed (1M context)
     )
