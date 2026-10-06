@@ -149,7 +149,7 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     if os.getenv("MODEL", "gemini") == "ollama":
         # offline: local embeddings (needs `ollama pull nomic-embed-text` once)
         from langchain_ollama import OllamaEmbeddings
-        return OllamaEmbeddings(model="nomic-embed-text", keep_alive="30m").embed_documents(texts)
+        return OllamaEmbeddings(model="nomic-embed-text", keep_alive=1800).embed_documents(texts)  # seconds, not "30m"
     resp = _genai().models.embed_content(model=EMBED_MODEL, contents=texts)
     return [list(e.values) for e in resp.embeddings]
 
