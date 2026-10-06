@@ -154,6 +154,11 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     return [list(e.values) for e in resp.embeddings]
 
 
+def _active_embed_model() -> str:
+    """The embedding model actually in use (follows the MODEL switch)."""
+    return "nomic-embed-text" if os.getenv("MODEL", "gemini") == "ollama" else EMBED_MODEL
+
+
 def build_index(docs: list[Document]) -> dict[str, list[float]]:
     """Embed every doc once. Returns {doc_id: vector}."""
     uncached = [d for d in docs if d.id not in _embedding_cache]
@@ -194,7 +199,7 @@ def embed_query(query: str) -> list[float]:
         vec = _embed_texts([query])[0]
         latency_ms = round((time.perf_counter() - t0) * 1000, 1)
         span.set_attributes({
-            "embedding.model": EMBED_MODEL,
+            "embedding.model": _active_embed_model(),
             "query.length_chars": len(query),
             "embedding.latency_ms": latency_ms,
             "query.rewritten": False,
