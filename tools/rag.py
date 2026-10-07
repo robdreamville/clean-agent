@@ -231,6 +231,7 @@ def search_store(qvec: list[float], index: dict[str, list[float]],
         )
         latency_ms = round((time.perf_counter() - t0) * 1000, 1)
         cands = [Candidate(doc=docs_by_id[doc_id], score=s) for doc_id, s in scored[:top_k]]
+        margin = round(cands[0].score - cands[1].score, 4) if len(cands) > 1 else 0.0
         span.set_attributes({
             "retrieval.doc_ids": [c.doc.id for c in cands],
             "retrieval.scores": [round(c.score, 4) for c in cands],
@@ -238,6 +239,9 @@ def search_store(qvec: list[float], index: dict[str, list[float]],
             "store.latency_ms": latency_ms,
             "store.index": "in-memory",
             "store.filters": "none",
+            "retrieval.margin": margin,
+            "eval.gate1_margin_pass": margin >= 0.10,
+
         })
         if CAPTURE_CONTENT:
             span.set_attribute("retrieval.doc_texts", [c.doc.text[:500] for c in cands])

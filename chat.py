@@ -1,5 +1,6 @@
 # chat.py — talk to the agent like a chatbot
 from langgraph.types import Command
+from opentelemetry import trace as otel_trace
 from agent import agent
 from langchain_core.runnables import RunnableConfig
 
@@ -39,9 +40,13 @@ while True:
         print(req)
         answer = input("approve or reject? ").strip().lower()
         decision = "approve" if answer.startswith("a") else "reject"
-        result = agent.invoke(
-            Command(resume={"decisions": [{"type": decision}]}),
-            config=config,
-        )
+        hitl_tracer = otel_trace.get_tracer("clean-agent.hitl")
+        with hitl_tracer.start_as_current_span("hitl.decision") as hspan:
+            hspan.set_attribute("hitl.decision", decision)
+            result = agent.invoke(
+                Command(resume={"decisions": [{"type": decision}]}),
+                config=config,
+            )
+
 
     print("agent:", get_text(result["messages"][-1]), "\n")

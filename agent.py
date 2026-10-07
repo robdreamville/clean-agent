@@ -27,13 +27,13 @@ if USE == "ollama":
         model="gemma4:e2b",
         keep_alive="30m",   # keep loaded between runs, skip the reload wait
         num_ctx=8192,       # room for long tool histories (default 2048 chops them)
-        num_predict=1024,   # cap output length: faster, less rambling
+        #num_predict=1024,   # cap output length: faster, less rambling
     )
 else:
     from langchain_google_genai import ChatGoogleGenerativeAI
     MODEL = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash",
-        max_output_tokens=1024,  # cap output length: less rambling, cheaper
+        #max_output_tokens=1024,  # cap output length: less rambling, cheaper
         # no keep_alive needed (API side), no num_ctx needed (1M context)
     )
 print(f"using model: {MODEL}")
@@ -41,9 +41,20 @@ print(f"using model: {MODEL}")
 from tools import ALL_TOOLS
 from middleware import MIDDLEWARE
 
+# Phoenix project for this run's traces. Explicit PHOENIX_PROJECT wins;
+# otherwise the agent names its own project by date.
+from datetime import date
+os.environ.setdefault("PHOENIX_PROJECT", f"clean-agent-{date.today().isoformat()}")
+
+
 from tools import init_rag
 
 print(f"rag index ready: {init_rag()} docs")
+
+# Agent-loop tracing: LangChain spans wrap the RAG spans, so Phoenix shows
+# the full loop (model -> tool -> rag.embed_query -> ...) in one trace.
+from openinference.instrumentation.langchain import LangChainInstrumentor
+LangChainInstrumentor().instrument()
 
 agent = create_agent(
     model=MODEL,
