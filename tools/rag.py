@@ -313,6 +313,7 @@ def retrieve(query: str) -> RetrievalResult:
     """Full pipeline. Opens the parent `retrieval` span; stages nest under it."""
     with tracer.start_as_current_span("retrieval") as span:
         span.set_attributes({"query.text": query, "pipeline.name": "rag"})
+        span.set_attribute("openinference.span.kind", "RETRIEVER")
         qvec = embed_query(query)
         cands = search_store(qvec, _INDEX, _DOCS_BY_ID)
         ranked = rerank(cands)

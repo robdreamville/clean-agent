@@ -43,6 +43,7 @@ while True:
         hitl_tracer = otel_trace.get_tracer("clean-agent.hitl")
         with hitl_tracer.start_as_current_span("hitl.decision") as hspan:
             hspan.set_attribute("hitl.decision", decision)
+            hspan.set_attribute("openinference.span.kind", "CHAIN")
             result = agent.invoke(
                 Command(resume={"decisions": [{"type": decision}]}),
                 config=config,
