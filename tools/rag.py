@@ -42,11 +42,23 @@ MAX_CONTEXT_TOKENS = 2000
 # Tracing setup
 # ---------------------------------------------------------------------------
 def init_tracing() -> None:
-    """Idempotent tracer setup. Call once per process before retrieving."""
+    """Idempotent tracer setup. Call once per process before retrieving.
+
+    Phoenix routes spans into projects via the ``openinference.project.name``
+    resource attribute (``service.name`` is ignored for project routing).
+    Override the project per run with the PHOENIX_PROJECT env var, e.g.:
+        $env:PHOENIX_PROJECT = "lesson6-batch"
+    """
+    project = os.environ.get("PHOENIX_PROJECT", "clean-agent-rag")
     provider = trace.get_tracer_provider()
     # Only install our provider if nobody else has (e.g. the harness later owns this).
     if isinstance(provider, trace.ProxyTracerProvider) or not hasattr(provider, "add_span_processor"):
-        resource = Resource.create({"service.name": "clean-agent-rag"})
+        resource = Resource.create(
+            {
+                "service.name": "clean-agent-rag",
+                "openinference.project.name": project,
+            }
+        )
         provider = TracerProvider(resource=resource)
         provider.add_span_processor(
             BatchSpanProcessor(OTLPSpanExporter(endpoint=PHOENIX_ENDPOINT))

@@ -8,7 +8,12 @@
 # Traces land in Phoenix automatically via the existing OTel setup.
 # After the batch: open Phoenix, one sentence per trace (first thing wrong
 # or "clean"), cluster into failure categories, count, find one silent failure.
+import os
 import time
+
+# Name the Phoenix project for this batch. Must be set before importing agent,
+# because the import initializes tracing (which reads PHOENIX_PROJECT).
+os.environ["PHOENIX_PROJECT"] = "rag-batch"
 
 from langgraph.types import Command
 
