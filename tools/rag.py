@@ -250,6 +250,8 @@ def search_store(qvec: list[float], index: dict[str, list[float]],
             verdict = "PASS"
         else:
             verdict = "WATCH"
+        global _LAST_GATE1_VERDICT
+        _LAST_GATE1_VERDICT = verdict
         span.set_attributes({
             "retrieval.doc_ids": [c.doc.id for c in cands],
             "retrieval.scores": [round(c.score, 4) for c in cands],
@@ -327,6 +329,12 @@ def assemble_context(ranked: list[Candidate],
 _INDEX: dict[str, list[float]] = {}
 _DOCS_BY_ID: dict[str, Document] = {}
 
+# Last retrieval, for the gate-2 judge. chat.py resets per turn; retrieve()
+# populates after each run. v1 pragmatism: the judge needs chunks + verdict,
+# and the LangChain tool boundary only passes text to the agent.
+LAST_RETRIEVAL: dict = {"chunks": [], "gate1_verdict": "PASS"}
+_LAST_GATE1_VERDICT: str = "PASS"
+
 
 def retrieve(query: str) -> RetrievalResult:
     """Full pipeline. Opens the parent `retrieval` span; stages nest under it."""
@@ -339,6 +347,9 @@ def retrieve(query: str) -> RetrievalResult:
         result = assemble_context(ranked)
         result.query = query
         span.set_attribute("retrieval.result_count", len(result.documents))
+        # Stash what the agent actually saw (post-rerank) for the judge.
+        LAST_RETRIEVAL["chunks"] = [c.doc.text for c in ranked]
+        LAST_RETRIEVAL["gate1_verdict"] = _LAST_GATE1_VERDICT
         return result
 
 
