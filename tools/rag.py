@@ -329,6 +329,23 @@ class Gate2Verdict(BaseModel):
     gate1_verdict: Literal["FAIL", "WATCH", "PASS"]
 
 
+def _parse_sufficiency(raw: str) -> SufficiencyCheck:
+    """Parse gate-2 output. Full JSON first; salvage the boolean from
+    truncated output (e.g. '{"sufficient": true,' cut off at the token cap).
+    Only raises if no boolean is recoverable at all."""
+    try:
+        return SufficiencyCheck.model_validate(json.loads(raw))
+    except Exception:
+        pass
+    m = re.search(r'"sufficient"\s*:\s*(true|false)', raw, re.IGNORECASE)
+    if m:
+        return SufficiencyCheck(
+            sufficient=m.group(1).lower() == "true",
+            evidence="recovered from partial output",
+        )
+    raise ValueError(f"unparseable gate 2 output: {raw[:200]}")
+
+
 def _gate2_model_primary():
     from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -455,7 +472,7 @@ def gate2_check(
             attempts += 1
             try:
                 raw, model_used = _ask_gate2(prompt)
-                check = SufficiencyCheck.model_validate(json.loads(raw))
+                check = _parse_sufficiency(raw)
                 break
             except Exception as e:
                 last_error = e
@@ -573,11 +590,15 @@ def retrieve(query: str) -> RetrievalResult:
         # Always run gate 2. Skipping it on FAIL is what caused the false
         # negative — gate 2 never saw the chunks that held the answer.
         gate2_verdict = gate2_check(query, ranked, gate1_verdict)
-        if gate2_verdict.verdict == "FLAG":
+        # Shaping: gate 2 has final say, EXCEPT when it errored. A broken
+        # judge is our infrastructure flakiness, not the retrieval's fault —
+        # so on gate2_error we defer to gate 1 rather than blinding the
+        # agent. The FLAG/gate2_error verdict stays honest in the trace.
+        if gate2_verdict.category == "insufficient_retrieval":
             keep = 0
         elif gate1_verdict == "PASS":
             keep = 2
-        else:  # WATCH or FAIL: uncertainty needs coverage
+        else:  # WATCH/FAIL, or gate2_error
             keep = 3
         result = assemble_context(ranked, keep=keep)
         result.query = query
