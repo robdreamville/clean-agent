@@ -37,6 +37,13 @@ TOP_K_SEARCH = 5
 TOP_K_RERANK = 3
 MAX_CONTEXT_TOKENS = 2000
 
+# Gate 1 thresholds — calibrated from the 30-trace batch (Oct 6), per embedding model.
+# Relevance floor: top-1 absolute score. Below this, nothing on point — FAIL.
+GATE1_RELEVANCE_FLOOR = 0.55
+# Separation line: top-1 minus top-2 margin. Below this with relevance held,
+# retrieval is ambiguous — WATCH.
+GATE1_MARGIN_LINE = 0.10
+
 
 # ---------------------------------------------------------------------------
 # Tracing setup
@@ -232,6 +239,17 @@ def search_store(qvec: list[float], index: dict[str, list[float]],
         latency_ms = round((time.perf_counter() - t0) * 1000, 1)
         cands = [Candidate(doc=docs_by_id[doc_id], score=s) for doc_id, s in scored[:top_k]]
         margin = round(cands[0].score - cands[1].score, 4) if len(cands) > 1 else 0.0
+        top1 = round(cands[0].score, 4)
+        # Two-signal gate 1: relevance (absolute) first, separation (margin) second.
+        # FAIL: nothing on point — caller should abstain, not generate.
+        # WATCH: material exists but ambiguous — generate, flag for harder gate-2 check.
+        # PASS: strong signal — generate normally. Gate 2 still verifies the answer.
+        if top1 < GATE1_RELEVANCE_FLOOR:
+            verdict = "FAIL"
+        elif len(cands) == 1 or margin >= GATE1_MARGIN_LINE:
+            verdict = "PASS"
+        else:
+            verdict = "WATCH"
         span.set_attributes({
             "retrieval.doc_ids": [c.doc.id for c in cands],
             "retrieval.scores": [round(c.score, 4) for c in cands],
@@ -239,9 +257,10 @@ def search_store(qvec: list[float], index: dict[str, list[float]],
             "store.latency_ms": latency_ms,
             "store.index": "in-memory",
             "store.filters": "none",
+            "retrieval.top1_score": top1,
             "retrieval.margin": margin,
-            "eval.gate1_margin_pass": margin >= 0.10,
-
+            "eval.gate1_verdict": verdict,
+            "eval.gate1_ambiguous": verdict == "WATCH",
         })
         if CAPTURE_CONTENT:
             span.set_attribute("retrieval.doc_texts", [c.doc.text[:500] for c in cands])
