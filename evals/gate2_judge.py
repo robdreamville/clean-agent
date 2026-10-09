@@ -140,7 +140,7 @@ def judge_gate2(
     init_tracing()
     strict = gate1_verdict == "WATCH"
     with tracer.start_as_current_span("evals.gate2_judge") as span:
-        span.set_attribute("openinference.span.kind", "CHAIN")
+        span.set_attribute("openinference.span.kind", "JUDGE")
         span.set_attribute("eval.gate1_verdict_in", gate1_verdict)
         span.set_attribute("eval.gate2_judge.model", JUDGE_MODEL)
 
