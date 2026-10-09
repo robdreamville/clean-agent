@@ -3,6 +3,8 @@ from langgraph.types import Command
 from opentelemetry import trace as otel_trace
 from agent import agent
 from langchain_core.runnables import RunnableConfig
+from evals.gate2_judge import judge_gate2
+from tools.rag import LAST_RETRIEVAL
 
 config: RunnableConfig = {"configurable": {"thread_id": "chat"}}
 
@@ -29,6 +31,11 @@ while True:
     if text.lower() in ("quit", "exit"):
         break
 
+    # Fresh turn: drop last turn's retrieval so the judge never scores
+    # this answer against stale chunks when the agent doesn't retrieve.
+    LAST_RETRIEVAL["chunks"] = []
+    LAST_RETRIEVAL["gate1_verdict"] = "PASS"
+
     result = agent.invoke(
         {"messages": [{"role": "user", "content": text}]},
         config=config,
@@ -49,5 +56,22 @@ while True:
                 config=config,
             )
 
+    answer_text = get_text(result["messages"][-1])
+    print("agent:", answer_text, "\n")
 
-    print("agent:", get_text(result["messages"][-1]), "\n")
+    # Gate 2: judge the final answer against what retrieval actually saw.
+    # Only runs when this turn retrieved; LAST_RETRIEVAL resets every turn
+    # so a stale previous turn never gets judged against.
+    if LAST_RETRIEVAL["chunks"]:
+        v = judge_gate2(
+            question=text,
+            answer=answer_text,
+            chunks=LAST_RETRIEVAL["chunks"],
+            gate1_verdict=LAST_RETRIEVAL["gate1_verdict"],
+        )
+        tag = f"[gate2: {v.verdict}" + (f" ({v.category})" if v.category else "") + "]"
+        print(tag)
+        if v.failed_claims:
+            for fc in v.failed_claims:
+                print(f"  - {fc}")
+        print()
