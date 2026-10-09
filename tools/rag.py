@@ -339,17 +339,40 @@ def _gate2_model_fallback():
     )
 
 
+def _invoke_traced(model, model_name: str, prompt: str) -> tuple[str, str]:
+    """Invoke the gate-2 model inside its own LLM span, nested under rag.gate2."""
+    with tracer.start_as_current_span("rag.gate2.llm") as span:
+        span.set_attribute("openinference.span.kind", "LLM")
+        span.set_attribute("llm.model_name", model_name)
+        t0 = time.perf_counter()
+        resp = model.invoke(prompt)
+        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+        usage = getattr(resp, "usage_metadata", None) or {}
+        prompt_tokens = usage.get("input_tokens", 0)
+        completion_tokens = usage.get("output_tokens", 0)
+        span.set_attributes({
+            "llm.latency_ms": latency_ms,
+            "llm.token_count.prompt": prompt_tokens,
+            "llm.token_count.completion": completion_tokens,
+            "llm.token_count.total": prompt_tokens + completion_tokens,
+        })
+        text = resp.content if isinstance(resp.content, str) else str(resp.content)
+        if CAPTURE_CONTENT:
+            span.set_attribute("llm.input_messages", prompt[:2000])
+            span.set_attribute("llm.output_messages", text[:2000])
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        return (m.group(0) if m else text), model_name
+
+
 def _ask_gate2(prompt: str) -> tuple[str, str]:
     """Try Gemini Flash first; fall back to Ollama offline. Returns (json, model)."""
-    try:
-        resp = _gate2_model_primary().invoke(prompt)
-        model_used = GATE2_GEMINI_MODEL
-    except Exception:
-        resp = _gate2_model_fallback().invoke(prompt)
-        model_used = GATE2_OLLAMA_MODEL
-    text = resp.content if isinstance(resp.content, str) else str(resp.content)
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    return (m.group(0) if m else text), model_used
+    for make, name in ((_gate2_model_primary, GATE2_GEMINI_MODEL),
+                       (_gate2_model_fallback, GATE2_OLLAMA_MODEL)):
+        try:
+            return _invoke_traced(make(), name, prompt)
+        except Exception:
+            continue
+    raise RuntimeError("gate 2: all models failed")
 
 
 def _numbered(chunks: list[str]) -> str:
@@ -453,12 +476,24 @@ def rerank(candidates: list[Candidate], top_k: int = TOP_K_RERANK) -> list[Candi
 
 
 def assemble_context(ranked: list[Candidate],
-                     max_tokens: int = MAX_CONTEXT_TOKENS) -> RetrievalResult:
+                     max_tokens: int = MAX_CONTEXT_TOKENS,
+                     gate1_verdict: str = "PASS") -> RetrievalResult:
     with tracer.start_as_current_span("rag.assemble_context") as span:
+        # Verdict-shaped context: the gate trims what the agent sees.
+        # PASS -> top 2 (doc 1 dominates by margin; doc 2 is a hedge).
+        # WATCH -> all (ambiguity needs coverage; trimming manufactures
+        #          false abstentions).
+        # FAIL -> none (nothing cleared the floor; noise invites confabulation).
+        if gate1_verdict == "FAIL":
+            shaped: list[Candidate] = []
+        elif gate1_verdict == "PASS":
+            shaped = ranked[:2]
+        else:  # WATCH
+            shaped = ranked
         kept: list[Candidate] = []
         truncated: list[str] = []
         running = 0
-        for c in ranked:
+        for c in shaped:
             t = _count_tokens(c.doc.text)
             if running + t > max_tokens:
                 truncated.append(c.doc.id)
@@ -479,6 +514,8 @@ def assemble_context(ranked: list[Candidate],
             "context.total_tokens": total_tokens,
             "context.truncated": truncated,
             "context.max_tokens": max_tokens,
+            "context.shaped_by_gate1": gate1_verdict,
+            "context.shaped_count": len(shaped),
         })
         return RetrievalResult(
             query="",  # filled by retrieve()
@@ -513,7 +550,7 @@ def retrieve(query: str) -> RetrievalResult:
         gate1_verdict = gate1_check(cands)
         ranked = rerank(cands)
         gate2_verdict = gate2_check(query, ranked, gate1_verdict)
-        result = assemble_context(ranked)
+        result = assemble_context(ranked, gate1_verdict=gate1_verdict)
         result.query = query
         span.set_attribute("retrieval.result_count", len(result.documents))
         span.set_attribute("eval.gate2_verdict", gate2_verdict.verdict)
