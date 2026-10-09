@@ -1,7 +1,9 @@
 """RAG pipeline with OpenTelemetry instrumentation — Lesson 5: Instrumented RAG QA.
 
-Pipeline: embed -> search -> rerank (stub) -> assemble_context.
-Each stage opens its own span; spans nest via ambient OTel context.
+Pipeline: embed -> search -> gate1 -> rerank -> gate2 -> assemble_context.
+Gate 1 is the cheap score tripwire (pre-rerank); gate 2 is the LLM
+retrieval-sufficiency check (post-rerank, pre-generation). Each stage opens
+its own span; spans nest via ambient OTel context.
 
 Standalone:  python -m tools.rag        -> `retrieval` is the root span in Phoenix.
 In harness:  agent calls rag_search()  -> spans nest under the harness trace, zero code changes.
@@ -11,11 +13,15 @@ then $RAG_DOCS_PATH). Each doc needs an id — parsed from the `doc_id:` field
 in the Metadata header, falling back to doc-001, doc-002, ...
 """
 
+import json
 import math
 import os
 import re
 import time
 from dataclasses import dataclass, field
+from typing import Literal, Optional
+
+from pydantic import BaseModel, Field
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -238,20 +244,6 @@ def search_store(qvec: list[float], index: dict[str, list[float]],
         )
         latency_ms = round((time.perf_counter() - t0) * 1000, 1)
         cands = [Candidate(doc=docs_by_id[doc_id], score=s) for doc_id, s in scored[:top_k]]
-        margin = round(cands[0].score - cands[1].score, 4) if len(cands) > 1 else 0.0
-        top1 = round(cands[0].score, 4)
-        # Two-signal gate 1: relevance (absolute) first, separation (margin) second.
-        # FAIL: nothing on point — caller should abstain, not generate.
-        # WATCH: material exists but ambiguous — generate, flag for harder gate-2 check.
-        # PASS: strong signal — generate normally. Gate 2 still verifies the answer.
-        if top1 < GATE1_RELEVANCE_FLOOR:
-            verdict = "FAIL"
-        elif len(cands) == 1 or margin >= GATE1_MARGIN_LINE:
-            verdict = "PASS"
-        else:
-            verdict = "WATCH"
-        global _LAST_GATE1_VERDICT
-        _LAST_GATE1_VERDICT = verdict
         span.set_attributes({
             "retrieval.doc_ids": [c.doc.id for c in cands],
             "retrieval.scores": [round(c.score, 4) for c in cands],
@@ -259,14 +251,189 @@ def search_store(qvec: list[float], index: dict[str, list[float]],
             "store.latency_ms": latency_ms,
             "store.index": "in-memory",
             "store.filters": "none",
+        })
+        if CAPTURE_CONTENT:
+            span.set_attribute("retrieval.doc_texts", [c.doc.text[:500] for c in cands])
+        return cands
+
+
+def gate1_check(cands: list[Candidate]) -> str:
+    """Gate 1: cheap score tripwire on the pre-rerank candidates.
+
+    Own stage, own span (rag.gate1), sibling to the other pipeline stages.
+    Two signals: relevance (absolute top-1) first, separation (margin) second.
+    FAIL: nothing on point. WATCH: material exists but ambiguous.
+    PASS: strong signal. Returns the verdict; gate 2 reads it for strictness.
+    """
+    with tracer.start_as_current_span("rag.gate1") as span:
+        margin = round(cands[0].score - cands[1].score, 4) if len(cands) > 1 else 0.0
+        top1 = round(cands[0].score, 4)
+        if top1 < GATE1_RELEVANCE_FLOOR:
+            verdict = "FAIL"
+        elif len(cands) == 1 or margin >= GATE1_MARGIN_LINE:
+            verdict = "PASS"
+        else:
+            verdict = "WATCH"
+        span.set_attributes({
             "retrieval.top1_score": top1,
             "retrieval.margin": margin,
             "eval.gate1_verdict": verdict,
             "eval.gate1_ambiguous": verdict == "WATCH",
         })
-        if CAPTURE_CONTENT:
-            span.set_attribute("retrieval.doc_texts", [c.doc.text[:500] for c in cands])
-        return cands
+        return verdict
+
+
+# ---------------------------------------------------------------------------
+# Gate 2: LLM retrieval-sufficiency check (pre-generation pipeline stage).
+# Lives here, not in evals/: it runs inside every retrieval, before the
+# agent generates. One question, yes or no: can this question be answered
+# from these chunks?
+# ---------------------------------------------------------------------------
+GATE2_GEMINI_MODEL = "gemini-2.5-flash"  # primary: free tier, fast, native JSON mode
+GATE2_OLLAMA_MODEL = "gemma4:e2b"        # offline fallback
+GATE2_NUM_PREDICT = 512
+GATE2_NUM_CTX = 4096
+GATE2_CHUNK_TRUNC = 500
+GATE2_MAX_CHUNKS = 5
+
+
+class Gate2Input(BaseModel):
+    question: str = Field(min_length=1, max_length=1000)
+    chunks: list[str] = Field(min_length=1, max_length=GATE2_MAX_CHUNKS)
+    gate1_verdict: Literal["FAIL", "WATCH", "PASS"]
+
+
+class SufficiencyCheck(BaseModel):
+    """Raw model output: one yes/no plus one sentence of evidence."""
+
+    sufficient: bool
+    evidence: str = Field(min_length=1, max_length=500)
+
+
+class Gate2Verdict(BaseModel):
+    verdict: Literal["PASS", "FLAG"]
+    category: Optional[Literal["insufficient_retrieval", "gate2_error"]] = None
+    evidence: str = ""
+    gate1_verdict: Literal["FAIL", "WATCH", "PASS"]
+
+
+def _gate2_model_primary():
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    return ChatGoogleGenerativeAI(
+        model=GATE2_GEMINI_MODEL,
+        response_mime_type="application/json",
+        max_output_tokens=GATE2_NUM_PREDICT,
+    )
+
+
+def _gate2_model_fallback():
+    from langchain_ollama import ChatOllama
+
+    return ChatOllama(
+        model=GATE2_OLLAMA_MODEL,
+        format="json",  # constrain to valid JSON; the small model needs the guardrail
+        keep_alive="30m",
+        num_ctx=GATE2_NUM_CTX,
+        num_predict=GATE2_NUM_PREDICT,
+    )
+
+
+def _ask_gate2(prompt: str) -> tuple[str, str]:
+    """Try Gemini Flash first; fall back to Ollama offline. Returns (json, model)."""
+    try:
+        resp = _gate2_model_primary().invoke(prompt)
+        model_used = GATE2_GEMINI_MODEL
+    except Exception:
+        resp = _gate2_model_fallback().invoke(prompt)
+        model_used = GATE2_OLLAMA_MODEL
+    text = resp.content if isinstance(resp.content, str) else str(resp.content)
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    return (m.group(0) if m else text), model_used
+
+
+def _numbered(chunks: list[str]) -> str:
+    return "\n".join(f"[{i}] {c}" for i, c in enumerate(chunks))
+
+
+def gate2_check(
+    question: str,
+    ranked: list[Candidate],
+    gate1_verdict: Literal["FAIL", "WATCH", "PASS"],
+) -> Gate2Verdict:
+    """Gate 2: can this question be answered from these chunks?
+
+    Runs post-rerank, pre-generation, nested under the retrieval span.
+    WATCH from gate 1 runs strict: ambiguous retrieval gets no benefit
+    of the doubt. Fail-closed: a broken check flags, never passes.
+    """
+    chunks = [c.doc.text[:GATE2_CHUNK_TRUNC] for c in ranked[:GATE2_MAX_CHUNKS]]
+    strict = gate1_verdict == "WATCH"
+    with tracer.start_as_current_span("rag.gate2") as span:
+        span.set_attribute("openinference.span.kind", "EVALUATOR")
+        span.set_attribute("eval.gate1_verdict_in", gate1_verdict)
+
+        if not chunks:
+            # Nothing retrieved: trivially insufficient, no model call needed.
+            verdict = Gate2Verdict(
+                verdict="FLAG",
+                category="insufficient_retrieval",
+                evidence="no chunks retrieved",
+                gate1_verdict=gate1_verdict,
+            )
+            span.set_attributes({
+                "eval.gate2.model": "none",
+                "eval.gate2_verdict": verdict.verdict,
+                "eval.gate2_category": verdict.category,
+                "eval.gate2_evidence": verdict.evidence,
+                "eval.gate2_strict": strict,
+            })
+            return verdict
+
+        judged = Gate2Input(question=question[:1000], chunks=chunks,
+                            gate1_verdict=gate1_verdict)
+        strict_note = (
+            "Retrieval was ambiguous. When in doubt, answer false."
+            if strict else ""
+        )
+        prompt = (
+            "You are a retrieval sufficiency check. Answer one question: "
+            "can the user's question be answered from these document chunks?\n\n"
+            f"Question: {judged.question}\n\n"
+            f"Chunks:\n{_numbered(judged.chunks)}\n\n"
+            f"{strict_note}\n"
+            "Reply with JSON only, exactly this shape:\n"
+            '{"sufficient": true, "evidence": "one sentence naming what supports it"}\n'
+            '{"sufficient": false, "evidence": "one sentence saying what is missing"}'
+        )
+
+        model_used = GATE2_GEMINI_MODEL
+        try:
+            raw, model_used = _ask_gate2(prompt)
+            check = SufficiencyCheck.model_validate(json.loads(raw))
+            verdict = Gate2Verdict(
+                verdict="PASS" if check.sufficient else "FLAG",
+                category=None if check.sufficient else "insufficient_retrieval",
+                evidence=check.evidence,
+                gate1_verdict=gate1_verdict,
+            )
+        except Exception as e:
+            # Fail closed: a broken check flags, never passes silently.
+            verdict = Gate2Verdict(
+                verdict="FLAG",
+                category="gate2_error",
+                evidence=f"gate 2 failed: {type(e).__name__}",
+                gate1_verdict=gate1_verdict,
+            )
+
+        span.set_attributes({
+            "eval.gate2.model": model_used,
+            "eval.gate2_verdict": verdict.verdict,
+            "eval.gate2_category": verdict.category or "none",
+            "eval.gate2_evidence": verdict.evidence[:500],
+            "eval.gate2_strict": strict,
+        })
+        return verdict
 
 
 def rerank(candidates: list[Candidate], top_k: int = TOP_K_RERANK) -> list[Candidate]:
@@ -329,27 +496,27 @@ def assemble_context(ranked: list[Candidate],
 _INDEX: dict[str, list[float]] = {}
 _DOCS_BY_ID: dict[str, Document] = {}
 
-# Last retrieval, for the gate-2 judge. chat.py resets per turn; retrieve()
-# populates after each run. v1 pragmatism: the judge needs chunks + verdict,
-# and the LangChain tool boundary only passes text to the agent.
-LAST_RETRIEVAL: dict = {"chunks": [], "gate1_verdict": "PASS"}
-_LAST_GATE1_VERDICT: str = "PASS"
-
 
 def retrieve(query: str) -> RetrievalResult:
-    """Full pipeline. Opens the parent `retrieval` span; stages nest under it."""
+    """Full pipeline. Opens the parent `retrieval` span; stages nest under it.
+
+    Stage order: embed -> search -> gate1 -> rerank -> gate2 -> assemble.
+    Gate 1 is the cheap score tripwire (pre-rerank, where the thresholds were
+    tuned). Gate 2 is the LLM sufficiency check on what the agent will
+    actually see (post-rerank). Neither blocks in Lesson 7; both emit verdicts.
+    """
     with tracer.start_as_current_span("retrieval") as span:
         span.set_attributes({"query.text": query, "pipeline.name": "rag"})
         span.set_attribute("openinference.span.kind", "RETRIEVER")
         qvec = embed_query(query)
         cands = search_store(qvec, _INDEX, _DOCS_BY_ID)
+        gate1_verdict = gate1_check(cands)
         ranked = rerank(cands)
+        gate2_verdict = gate2_check(query, ranked, gate1_verdict)
         result = assemble_context(ranked)
         result.query = query
         span.set_attribute("retrieval.result_count", len(result.documents))
-        # Stash what the agent actually saw (post-rerank) for the judge.
-        LAST_RETRIEVAL["chunks"] = [c.doc.text for c in ranked]
-        LAST_RETRIEVAL["gate1_verdict"] = _LAST_GATE1_VERDICT
+        span.set_attribute("eval.gate2_verdict", gate2_verdict.verdict)
         return result
 
 
