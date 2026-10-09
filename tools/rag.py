@@ -265,16 +265,17 @@ def search_store(qvec: list[float], index: dict[str, list[float]],
 
 
 def gate1_check(cands: list[Candidate]) -> str:
-    """Gate 1: cheap preliminary filter on the pre-rerank candidates.
+    """Gate 1: cheap advisory signal on the pre-rerank candidates.
 
     Own stage, own span (rag.gate1), sibling to the other pipeline stages.
-    This is NOT the final say — it only stops obvious junk so gate 2's LLM
-    call isn't wasted on garbage. Everything plausible goes to gate 2,
-    which decides what the agent sees.
-    FAIL: nothing in the ballpark — skip gate 2, agent gets nothing.
+    ADVISORY ONLY — it cannot stop anything. A wrong FAIL once blinded the
+    agent by skipping gate 2 (the "user's name" false negative). Never again.
+    Gate 2 always runs and has the final say.
+    FAIL: scores look like junk — gate 2 runs extra strict.
     WATCH: material exists but ambiguous — gate 2 runs strict.
     PASS: strong signal — gate 2 runs normally.
-    Returns the verdict; gate 2 reads it for strictness.
+    Returns the verdict; gate 2 reads it for strictness, retrieve() reads it
+    for doc count.
     """
     with tracer.start_as_current_span("rag.gate1") as span:
         margin = round(cands[0].score - cands[1].score, 4) if len(cands) > 1 else 0.0
@@ -402,7 +403,9 @@ def gate2_check(
     of the doubt. Fail-closed: a broken check flags, never passes.
     """
     chunks = [c.doc.text[:GATE2_CHUNK_TRUNC] for c in ranked[:GATE2_MAX_CHUNKS]]
-    strict = gate1_verdict == "WATCH"
+    # Strict when gate 1 is skeptical (WATCH or FAIL): ambiguous or
+    # junk-looking retrieval gets no benefit of the doubt.
+    strict = gate1_verdict in ("WATCH", "FAIL")
     with tracer.start_as_current_span("rag.gate2") as span:
         span.set_attribute("openinference.span.kind", "EVALUATOR")
         span.set_attribute("eval.gate1_verdict_in", gate1_verdict)
@@ -540,9 +543,11 @@ def retrieve(query: str) -> RetrievalResult:
     """Full pipeline. Opens the parent `retrieval` span; stages nest under it.
 
     Stage order: embed -> search -> gate1 -> rerank -> gate2 -> assemble.
-    Gate 1 is a loose pre-filter: it stops obvious junk so gate 2's LLM call
-    isn't wasted. Gate 2 has the final say on what the agent sees. When the
-    two disagree, the smarter check (gate 2) wins.
+    Gate 1 is advisory: a cheap signal tuning gate 2's strictness. It cannot
+    blind the agent. Gate 2 ALWAYS runs — even on gate-1 FAIL — and has the
+    final say on what the agent sees. That's how it catches gate 1's
+    mistakes (the "user's name" false negative: gate 1 said FAIL, gate 2
+    correctly said the chunks held the answer).
     """
     with tracer.start_as_current_span("retrieval") as span:
         span.set_attributes({"query.text": query, "pipeline.name": "rag"})
@@ -551,24 +556,20 @@ def retrieve(query: str) -> RetrievalResult:
         cands = search_store(qvec, _INDEX, _DOCS_BY_ID)
         gate1_verdict = gate1_check(cands)
         ranked = rerank(cands)
-        if gate1_verdict == "FAIL":
-            # Preliminary stop: obvious junk, no LLM call wasted.
-            gate2_label = "skipped"
+        # Always run gate 2. Skipping it on FAIL is what caused the false
+        # negative — gate 2 never saw the chunks that held the answer.
+        gate2_verdict = gate2_check(query, ranked, gate1_verdict)
+        if gate2_verdict.verdict == "FLAG":
             keep = 0
-        else:
-            gate2_verdict = gate2_check(query, ranked, gate1_verdict)
-            gate2_label = gate2_verdict.verdict
-            if gate2_verdict.verdict == "FLAG":
-                keep = 0
-            elif gate1_verdict == "PASS":
-                keep = 2
-            else:  # WATCH
-                keep = 3
+        elif gate1_verdict == "PASS":
+            keep = 2
+        else:  # WATCH or FAIL: uncertainty needs coverage
+            keep = 3
         result = assemble_context(ranked, keep=keep)
         result.query = query
         span.set_attribute("retrieval.result_count", len(result.documents))
         span.set_attribute("eval.gate1_verdict", gate1_verdict)
-        span.set_attribute("eval.gate2_verdict", gate2_label)
+        span.set_attribute("eval.gate2_verdict", gate2_verdict.verdict)
         return result
 
 
