@@ -316,10 +316,10 @@ class Gate2Input(BaseModel):
 
 
 class SufficiencyCheck(BaseModel):
-    """Raw model output: one yes/no plus one sentence of evidence."""
+    """Raw model output: one yes/no plus ten words max of evidence."""
 
     sufficient: bool
-    evidence: str = Field(min_length=1, max_length=500)
+    evidence: str = Field(min_length=1, max_length=200)
 
 
 class Gate2Verdict(BaseModel):
@@ -439,27 +439,40 @@ def gate2_check(
             f"Question: {judged.question}\n\n"
             f"Chunks:\n{_numbered(judged.chunks)}\n\n"
             f"{strict_note}\n"
-            "Reply with JSON only, exactly this shape:\n"
-            '{"sufficient": true, "evidence": "one sentence naming what supports it"}\n'
-            '{"sufficient": false, "evidence": "one sentence saying what is missing"}'
+            "Reply with JSON only, exactly this shape. Evidence is ten words max.\n"
+            '{"sufficient": true, "evidence": "ten words max naming what supports it"}\n'
+            '{"sufficient": false, "evidence": "ten words max saying what is missing"}'
         )
 
         model_used = GATE2_GEMINI_MODEL
-        try:
-            raw, model_used = _ask_gate2(prompt)
-            check = SufficiencyCheck.model_validate(json.loads(raw))
-            verdict = Gate2Verdict(
-                verdict="PASS" if check.sufficient else "FLAG",
-                category=None if check.sufficient else "insufficient_retrieval",
-                evidence=check.evidence,
-                gate1_verdict=gate1_verdict,
-            )
-        except Exception as e:
+        check = None
+        last_error = None
+        attempts = 0
+        # Retry once on transient failure (e.g. truncated JSON). A judge that
+        # fails on first try often succeeds on the second; only after both
+        # fail do we flag gate2_error.
+        for _ in range(2):
+            attempts += 1
+            try:
+                raw, model_used = _ask_gate2(prompt)
+                check = SufficiencyCheck.model_validate(json.loads(raw))
+                break
+            except Exception as e:
+                last_error = e
+                continue
+        if check is None:
             # Fail closed: a broken check flags, never passes silently.
             verdict = Gate2Verdict(
                 verdict="FLAG",
                 category="gate2_error",
-                evidence=f"gate 2 failed: {type(e).__name__}",
+                evidence=f"gate 2 failed after retry: {type(last_error).__name__}",
+                gate1_verdict=gate1_verdict,
+            )
+        else:
+            verdict = Gate2Verdict(
+                verdict="PASS" if check.sufficient else "FLAG",
+                category=None if check.sufficient else "insufficient_retrieval",
+                evidence=check.evidence,
                 gate1_verdict=gate1_verdict,
             )
 
@@ -469,6 +482,7 @@ def gate2_check(
             "eval.gate2_category": verdict.category or "none",
             "eval.gate2_evidence": verdict.evidence[:500],
             "eval.gate2_strict": strict,
+            "eval.gate2_attempts": attempts,
         })
         return verdict
 
