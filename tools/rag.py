@@ -43,9 +43,16 @@ TOP_K_SEARCH = 5
 TOP_K_RERANK = 3
 MAX_CONTEXT_TOKENS = 2000
 
-# Gate 1 thresholds — calibrated from the 30-trace batch (Oct 6), per embedding model.
-# Relevance floor: top-1 absolute score. Below this, nothing on point — FAIL.
-GATE1_RELEVANCE_FLOOR = 0.55
+# Gate 1 is a LOOSE pre-filter, not the final say. It stops only obvious junk
+# so the expensive gate-2 LLM call isn't wasted. Gate 2 decides what passes.
+# Relevance floor: top-1 absolute score. Below this, nothing is even in the
+# ballpark — FAIL, skip gate 2.
+# PROVISIONAL (picked blind, Oct 9): 0.55 was verified WRONG — it killed a
+# good retrieval ("user's name" scored below it). 0.30 is a guess. Calibrate
+# properly: run the batch, record top-1 scores with human good/bad labels,
+# set the floor below the worst good retrieval. Do not ship a number you
+# can't justify from data.
+GATE1_RELEVANCE_FLOOR = 0.30
 # Separation line: top-1 minus top-2 margin. Below this with relevance held,
 # retrieval is ambiguous — WATCH.
 GATE1_MARGIN_LINE = 0.10
@@ -258,12 +265,16 @@ def search_store(qvec: list[float], index: dict[str, list[float]],
 
 
 def gate1_check(cands: list[Candidate]) -> str:
-    """Gate 1: cheap score tripwire on the pre-rerank candidates.
+    """Gate 1: cheap preliminary filter on the pre-rerank candidates.
 
     Own stage, own span (rag.gate1), sibling to the other pipeline stages.
-    Two signals: relevance (absolute top-1) first, separation (margin) second.
-    FAIL: nothing on point. WATCH: material exists but ambiguous.
-    PASS: strong signal. Returns the verdict; gate 2 reads it for strictness.
+    This is NOT the final say — it only stops obvious junk so gate 2's LLM
+    call isn't wasted on garbage. Everything plausible goes to gate 2,
+    which decides what the agent sees.
+    FAIL: nothing in the ballpark — skip gate 2, agent gets nothing.
+    WATCH: material exists but ambiguous — gate 2 runs strict.
+    PASS: strong signal — gate 2 runs normally.
+    Returns the verdict; gate 2 reads it for strictness.
     """
     with tracer.start_as_current_span("rag.gate1") as span:
         margin = round(cands[0].score - cands[1].score, 4) if len(cands) > 1 else 0.0
@@ -477,19 +488,11 @@ def rerank(candidates: list[Candidate], top_k: int = TOP_K_RERANK) -> list[Candi
 
 def assemble_context(ranked: list[Candidate],
                      max_tokens: int = MAX_CONTEXT_TOKENS,
-                     gate1_verdict: str = "PASS") -> RetrievalResult:
+                     keep: int = 3) -> RetrievalResult:
     with tracer.start_as_current_span("rag.assemble_context") as span:
-        # Verdict-shaped context: the gate trims what the agent sees.
-        # PASS -> top 2 (doc 1 dominates by margin; doc 2 is a hedge).
-        # WATCH -> all (ambiguity needs coverage; trimming manufactures
-        #          false abstentions).
-        # FAIL -> none (nothing cleared the floor; noise invites confabulation).
-        if gate1_verdict == "FAIL":
-            shaped: list[Candidate] = []
-        elif gate1_verdict == "PASS":
-            shaped = ranked[:2]
-        else:  # WATCH
-            shaped = ranked
+        # How many docs the agent sees is decided by retrieve(), from the
+        # gate verdicts. Gate 1 filters junk; gate 2 has the final say.
+        shaped = ranked[:keep] if keep > 0 else []
         kept: list[Candidate] = []
         truncated: list[str] = []
         running = 0
@@ -514,8 +517,7 @@ def assemble_context(ranked: list[Candidate],
             "context.total_tokens": total_tokens,
             "context.truncated": truncated,
             "context.max_tokens": max_tokens,
-            "context.shaped_by_gate1": gate1_verdict,
-            "context.shaped_count": len(shaped),
+            "context.shaped_keep": keep,
         })
         return RetrievalResult(
             query="",  # filled by retrieve()
@@ -538,9 +540,9 @@ def retrieve(query: str) -> RetrievalResult:
     """Full pipeline. Opens the parent `retrieval` span; stages nest under it.
 
     Stage order: embed -> search -> gate1 -> rerank -> gate2 -> assemble.
-    Gate 1 is the cheap score tripwire (pre-rerank, where the thresholds were
-    tuned). Gate 2 is the LLM sufficiency check on what the agent will
-    actually see (post-rerank). Neither blocks in Lesson 7; both emit verdicts.
+    Gate 1 is a loose pre-filter: it stops obvious junk so gate 2's LLM call
+    isn't wasted. Gate 2 has the final say on what the agent sees. When the
+    two disagree, the smarter check (gate 2) wins.
     """
     with tracer.start_as_current_span("retrieval") as span:
         span.set_attributes({"query.text": query, "pipeline.name": "rag"})
@@ -549,11 +551,24 @@ def retrieve(query: str) -> RetrievalResult:
         cands = search_store(qvec, _INDEX, _DOCS_BY_ID)
         gate1_verdict = gate1_check(cands)
         ranked = rerank(cands)
-        gate2_verdict = gate2_check(query, ranked, gate1_verdict)
-        result = assemble_context(ranked, gate1_verdict=gate1_verdict)
+        if gate1_verdict == "FAIL":
+            # Preliminary stop: obvious junk, no LLM call wasted.
+            gate2_label = "skipped"
+            keep = 0
+        else:
+            gate2_verdict = gate2_check(query, ranked, gate1_verdict)
+            gate2_label = gate2_verdict.verdict
+            if gate2_verdict.verdict == "FLAG":
+                keep = 0
+            elif gate1_verdict == "PASS":
+                keep = 2
+            else:  # WATCH
+                keep = 3
+        result = assemble_context(ranked, keep=keep)
         result.query = query
         span.set_attribute("retrieval.result_count", len(result.documents))
-        span.set_attribute("eval.gate2_verdict", gate2_verdict.verdict)
+        span.set_attribute("eval.gate1_verdict", gate1_verdict)
+        span.set_attribute("eval.gate2_verdict", gate2_label)
         return result
 
 
