@@ -52,7 +52,7 @@ MAX_CONTEXT_TOKENS = 2000
 # properly: run the batch, record top-1 scores with human good/bad labels,
 # set the floor below the worst good retrieval. Do not ship a number you
 # can't justify from data.
-GATE1_RELEVANCE_FLOOR = 0.30
+GATE1_RELEVANCE_FLOOR = 0.54
 # Separation line: top-1 minus top-2 margin. Below this with relevance held,
 # retrieval is ambiguous — WATCH.
 GATE1_MARGIN_LINE = 0.10
