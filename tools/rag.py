@@ -316,10 +316,10 @@ class Gate2Input(BaseModel):
 
 
 class SufficiencyCheck(BaseModel):
-    """Raw model output: one yes/no plus ten words max of evidence."""
+    """Raw model output: one yes/no plus evidence (2 short sentences max)."""
 
     sufficient: bool
-    evidence: str = Field(min_length=1, max_length=200)
+    evidence: str = Field(min_length=1, max_length=300)
 
 
 class Gate2Verdict(BaseModel):
@@ -456,9 +456,11 @@ def gate2_check(
             f"Question: {judged.question}\n\n"
             f"Chunks:\n{_numbered(judged.chunks)}\n\n"
             f"{strict_note}\n"
-            "Reply with JSON only, exactly this shape. Evidence is ten words max.\n"
-            '{"sufficient": true, "evidence": "ten words max naming what supports it"}\n'
-            '{"sufficient": false, "evidence": "ten words max saying what is missing"}'
+            "Reply with JSON only, exactly this shape. "
+            "Evidence is 2 short sentences max — keep it brief, the token "
+            "budget is tight.\n"
+            '{"sufficient": true, "evidence": "two short sentences naming what supports it"}\n'
+            '{"sufficient": false, "evidence": "two short sentences saying what is missing"}'
         )
 
         model_used = GATE2_GEMINI_MODEL
